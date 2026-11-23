@@ -168,11 +168,17 @@ def _resize_and_save(
     copy. save_image() must run before the file closes, or converting that
     now-fp-less image (e.g. grayscale -> RGB) fails with "'NoneType' object
     has no attribute 'seek'" / "Operation on closed image".
+
+    The source's ICC profile is kept: the pixels are not converted, and
+    ``ultrahdr_app -m 0`` keeps a base image's profile, but tags the result sRGB
+    when there is none, which shows a Display P3 photo washed out.
     """
     processor_cls = getattr(pilkit.processors, settings["img_processor"])
     with Image.open(src_path) as img:
         width, height = _resized_size(img, settings)
         resized = processor_cls(width, height, upscale=False).process(img)
+        if icc := img.info.get("icc_profile"):
+            options = {**options, "icc_profile": icc}
         save_image(resized, dst_path, "JPEG", options=options, autoconvert=True)
 
 
