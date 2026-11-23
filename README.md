@@ -42,6 +42,8 @@ rather than "MPO"):
    Pillow processor/`img_size`/`jpg_options` sigal already uses.
 4. Remerge them (`ultrahdr_app -m 0 -i base -g gainmap -f metadata.cfg`).
 
+**Per-channel gain-map XMP.** Lightroom Classic 13 (2023–2024) writes RGB gain-map metadata only as XMP, with one value per colour channel (an `rdf:Seq`), and no ISO 21496-1 metadata. libultrahdr's XMP reader (2.0.2, and `main` as of 2026-11-19) takes only single values, so `ultrahdr_app` rejects these files with "could not find attribute hdrgm:GainMapMax". For that error only, the plugin reads the gain map's `hdrgm` XMP with exiftool and writes `metadata.cfg` itself (per channel, log2 values made linear), so steps 2--4 run as usual.
+
 Thumbnails are always flattened SDR (small previews don't need HDR, and
 `ultrahdr_app` has no thumbnail-box resize mode anyway).
 

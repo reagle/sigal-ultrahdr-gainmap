@@ -25,6 +25,7 @@ package)::
     plugins = ["ultrahdr_gainmap"]
 """
 
+import json
 import logging
 import multiprocessing
 import shutil
@@ -45,6 +46,81 @@ logger = logging.getLogger(__name__)
 #: Generous but bounded; a hung exiftool/ultrahdr_app call shouldn't stall a build.
 _SUBPROCESS_TIMEOUT = 60
 
+#: How ``ultrahdr_app`` (libultrahdr 2.0.2) fails on gain-map XMP holding one value per
+#: colour channel (an ``rdf:Seq``), as Lightroom Classic 13 writes it without the ISO
+#: 21496-1 metadata libultrahdr would otherwise read: its XMP reader takes only
+#: single-valued attributes. The plugin then reads the XMP itself (see _hdrgm_cfg).
+_MULTICHANNEL_XMP_ERROR = "could not find attribute hdrgm:"
+
+#: hdrgm XMP field, ultrahdr_app metadata.cfg flag, and whether XMP stores it as log2.
+_HDRGM_CFG = (
+    ("GainMapMax", "maxContentBoost", True),
+    ("GainMapMin", "minContentBoost", True),
+    ("Gamma", "gamma", False),
+    ("OffsetSDR", "offsetSdr", False),
+    ("OffsetHDR", "offsetHdr", False),
+    ("HDRCapacityMin", "hdrCapacityMin", True),
+    ("HDRCapacityMax", "hdrCapacityMax", True),
+)
+
+
+def _hdrgm_cfg(tags: dict[str, Any]) -> str | None:
+    """Return ultrahdr_app metadata.cfg text for a gain map's hdrgm XMP tags.
+
+    ``tags`` are as ``exiftool -j -n`` gives them. Values stay per channel; the
+    log2 ones are made linear, as ``ultrahdr_app -m 1 -f`` writes them. None where
+    a field is missing or the base rendition is HDR, which metadata.cfg cannot say.
+
+    >>> print(_hdrgm_cfg({
+    ...     "GainMapMax": [3.0, 2.0, 1.0], "GainMapMin": 0, "Gamma": [1, 0.5, 0.25],
+    ...     "OffsetSDR": 0.015625, "OffsetHDR": 0.015625,
+    ...     "HDRCapacityMin": 0, "HDRCapacityMax": 3, "BaseRenditionIsHDR": False,
+    ... }), end="")
+    --maxContentBoost 8.0 4.0 2.0
+    --minContentBoost 1.0
+    --gamma 1 0.5 0.25
+    --offsetSdr 0.015625
+    --offsetHdr 0.015625
+    --hdrCapacityMin 1.0
+    --hdrCapacityMax 8.0
+    --useBaseColorSpace 1
+    >>> _hdrgm_cfg({"GainMapMax": 3.0}) is None
+    True
+    """
+    if tags.get("BaseRenditionIsHDR") is True:
+        return None
+    lines = []
+    for field, flag, is_log2 in _HDRGM_CFG:
+        value = tags.get(field)
+        if value is None:
+            return None
+        values = value if isinstance(value, list) else [value]
+        values = [2.0**v if is_log2 else v for v in values]
+        lines.append(f"--{flag} " + " ".join(str(v) for v in values))
+    return "\n".join([*lines, "--useBaseColorSpace 1"]) + "\n"
+
+
+def _run_bytes(args: list[str], stdin: bytes | None = None) -> bytes:
+    """Return a subprocess's stdout, raising on failure or a hang."""
+    return subprocess.run(
+        args, input=stdin, capture_output=True, check=True, timeout=_SUBPROCESS_TIMEOUT
+    ).stdout
+
+
+def _hdrgm_tags(gain_map: bytes) -> dict[str, Any]:
+    """Return the hdrgm XMP of a gain-map JPEG's bytes, per exiftool."""
+    out = _run_bytes(["exiftool", "-j", "-n", "-XMP-hdrgm:all", "-"], gain_map)
+    return json.loads(out)[0]
+
+
+def _has_multichannel_xmp_gain_map(src_path: str) -> bool:
+    """Whether a JPEG's second MPF image has gain-map XMP that _hdrgm_cfg reads."""
+    try:
+        gain_map = _run_bytes(["exiftool", "-b", "-MPImage2", src_path])
+        return bool(gain_map) and _hdrgm_cfg(_hdrgm_tags(gain_map)) is not None
+    except (OSError, subprocess.SubprocessError, ValueError, IndexError):
+        return False
+
 
 def _has_gain_map(src_path: str) -> bool:
     """Whether a JPEG carries a gain map, per ``ultrahdr_app`` (authoritative).
@@ -53,7 +129,8 @@ def _has_gain_map(src_path: str) -> bool:
     JPEGs as plain "JPEG" rather than "MPO" (observed on a Lightroom Classic
     15.5 export that an earlier 14.2 export didn't trigger), so gating on
     Pillow's format string silently missed real gain maps. ~10ms/call here
-    is an acceptable cost for correctness.
+    is an acceptable cost for correctness. Where ``ultrahdr_app`` cannot read
+    per-channel gain-map XMP (_MULTICHANNEL_XMP_ERROR), the XMP is read here.
     """
     try:
         result = subprocess.run(
@@ -65,7 +142,11 @@ def _has_gain_map(src_path: str) -> bool:
         )
     except (OSError, subprocess.TimeoutExpired):
         return False
-    return "Ultra HDR Image: Yes" in result.stdout
+    if "Ultra HDR Image: Yes" in result.stdout:
+        return True
+    if _MULTICHANNEL_XMP_ERROR in result.stdout + result.stderr:
+        return _has_multichannel_xmp_gain_map(src_path)
+    return False
 
 
 def _resized_size(img: Image.Image, settings: dict[str, Any]) -> tuple[int, int]:
@@ -116,7 +197,7 @@ def _merge_gain_map(media: Any, settings: dict[str, Any]) -> None:
                 check=True,
                 timeout=_SUBPROCESS_TIMEOUT,
             )
-        subprocess.run(
+        dump = subprocess.run(
             [
                 "ultrahdr_app",
                 "-m",
@@ -126,10 +207,21 @@ def _merge_gain_map(media: Any, settings: dict[str, Any]) -> None:
                 "-f",
                 str(metadata_cfg),
             ],
-            check=True,
             capture_output=True,
+            text=True,
             timeout=_SUBPROCESS_TIMEOUT,
+            check=False,
         )
+        if dump.returncode != 0:
+            # Per-channel gain-map XMP that ultrahdr_app cannot read: read it here.
+            cfg = None
+            if _MULTICHANNEL_XMP_ERROR in dump.stdout + dump.stderr:
+                cfg = _hdrgm_cfg(_hdrgm_tags(gainmap_src.read_bytes()))
+            if cfg is None:
+                raise subprocess.CalledProcessError(
+                    dump.returncode, dump.args, dump.stdout, dump.stderr
+                )
+            metadata_cfg.write_text(cfg)
 
         _resize_and_save(media.src_path, str(base_out), settings, options)
         _resize_and_save(str(gainmap_src), str(gainmap_out), settings, options)
